@@ -105,10 +105,118 @@ npm run sqlite:backup -- /data-backup/streams-$(date +%Y%m%d-%H%M%S).db
 
 The helper fails before opening SQLite when `DB_PATH` is missing/unreadable,
 the destination directory is missing/unwritable, `DATABASE_URL` selects
-PostgreSQL, or `sqlite3` is unavailable. It never prints environment values.
-An interrupted backup or a failed integrity check removes only its temporary
-file and preserves any existing destination. A fresh Compose database is
-reported as `transient_delay` during startup until migrations complete.
+PostgreSQL, `sqlite3` is unavailable, or one of the tunables below is not a
+non-negative integer. It never prints environment values. A fresh Compose
+database is reported as `transient_delay` during startup until migrations
+complete.
+
+Every run ends in one of three states, so the outcome is machine-checkable in a
+backup job:
+
+| Exit | State | Destination |
+| ---- | -------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `0` | verified healthy — the published file passed integrity checks | replaced with the new snapshot |
+| `1` | interrupted before completion, or unverified after retries | untouched; the run prints the rollback step and cleans up its own temp file |
+| `2` | preflight or configuration failure | nothing was attempted; this class of failure is never retried |
+
+| Tunable                             | Default | Meaning                                                        |
+| ----------------------------------- | ------- | -------------------------------------------------------------- |
+| `SQLITE_BACKUP_TIMEOUT_MS`          | `5000`  | busy timeout per snapshot attempt while the database is writable |
+| `SQLITE_BACKUP_RETRIES`             | `2`     | extra attempts after the first; `0` makes the run single-shot   |
+| `SQLITE_BACKUP_RETRY_DELAY_SECONDS` | `3`     | wait between attempts                                           |
+| `SQLITE_BACKUP_STALE_MINUTES`       | `60`    | age at which a leftover `.sqlite-backup.*` file is reported     |
+
+#### When a backup is interrupted before completion
+
+A backup can be interrupted in two places: the snapshot never finished (killed
+process, lock contention, disk pressure), or it finished and passed its checks
+but the published file is not usable. Both stop with exit `1` and a `ROLLBACK:`
+line; neither can leave a half-written backup in place of a good one.
+
+**Detection**
+
+1. Read the exit code and the `ROLLBACK:` line of the backup run. Exit `1` means
+   interrupted; exit `2` means the job was misconfigured and retrying it is
+   pointless.
+2. Look for a leftover snapshot beside the destination. The helper reports them
+   itself on its next run:
+   ```bash
+   ls -a /data-backup | grep '^\.sqlite-backup\.'
+   ```
+   Any `.sqlite-backup.*` file older than the job's normal runtime is a backup
+   that died mid-copy. It is never a restorable snapshot.
+3. Confirm what you actually hold, before relying on it:
+   ```bash
+   bash scripts/sqlite-backup.sh --verify /data-backup/streams.db
+   # Same thing through npm: npm run sqlite:verify -- /data-backup/streams.db
+   ```
+   Exit `0` means the file is complete and intact; exit `1` means it must be
+   discarded, and the command prints the rollback step.
+4. If a restore already happened, the backend reports the same condition at
+   startup as `sqlite_restore_outcome 3` (`interrupted`).
+
+**Safe retry boundaries**
+
+- Retried: a snapshot that did not complete, an empty snapshot file, or a
+  snapshot that fails `PRAGMA integrity_check` — up to `SQLITE_BACKUP_RETRIES`
+  extra attempts, spaced by `SQLITE_BACKUP_RETRY_DELAY_SECONDS`.
+- Never retried: preflight and configuration failures (exit `2`), and the
+  publish/confirm phase. Only attempt `1 + SQLITE_BACKUP_RETRIES` snapshots, so
+  a stuck lock cannot turn one backup job into an unbounded loop.
+- Re-running the helper is always safe: it writes a new temporary file and never
+  edits the live database, so an interrupted run costs nothing but the partial
+  snapshot.
+- Do not raise the retry budget to work around `database locked`. Repeated lock
+  contention means the writer is saturating the busy timeout — take the backup
+  at a quieter moment or increase `SQLITE_BACKUP_TIMEOUT_MS`, and treat a third
+  consecutive failure as an incident rather than a retry candidate.
+
+**Recovery — reach a verified healthy state, or stop with a rollback**
+
+1. Resolve the cause named in the `FAIL:` line (free disk, stop competing
+   writers, install `sqlite3`, correct `DB_PATH`).
+2. Remove the partial snapshot the run left behind, if any. The helper only ever
+   deletes its own temp file; a leftover from a killed process is yours to
+   delete after confirming no backup is still running:
+   ```bash
+   rm -f -- '/data-backup/.sqlite-backup.abc123'
+   ```
+3. Re-run the backup once:
+   ```bash
+   DB_PATH=/data/streams.db bash scripts/sqlite-backup.sh /data-backup/streams.db
+   ```
+   A success prints `RESULT: PASS` and exits `0`; that published file is the
+   verified healthy state, and it is the only file that should be treated as a
+   backup.
+4. If it still exits `1`, stop. The previous backup at that destination was left
+   untouched by the failed attempts, so roll back to it rather than accumulating
+   unverified copies:
+   ```bash
+   # The destination still holds the last snapshot that was verified.
+   bash scripts/sqlite-backup.sh --verify /data-backup/streams.db
+   # To restore it (backend stopped):
+   pm2 stop stellar-stream-backend
+   cp -p -- /data-backup/streams.db /data/streams.db
+   rm -f /data/streams.db-wal /data/streams.db-shm
+   pm2 start stellar-stream-backend
+   curl -s http://localhost:3001/metrics | grep sqlite_restore_outcome
+   ```
+   `sqlite_restore_outcome` must read `0`. If no destination passes `--verify`,
+   there is no usable backup: take a fresh one from the live database as soon as
+   the cause in step 1 is fixed, and treat the interval as an availability risk.
+5. Record the outcome. A backup job that exits `1` three times in a row is an
+   incident, not a flaky job.
+
+**If a published backup later turns out unhealthy**
+
+The helper re-checks the file after the atomic rename. When that check fails it
+puts the previous backup back and exits `1` — you get the previous snapshot, not
+a broken one. Only when no previous backup existed does it remove the unverified
+file, leaving the destination absent rather than misleading. In both cases the
+live database is never modified; restore from the last file that passes
+`--verify`. Publishing keeps one brief copy of the previous snapshot beside the
+destination, so the backup directory needs room for roughly two backups during
+the swap; a full filesystem shows up as exit `1`, not as a damaged backup.
 
 #### Restoring a backup in a clean environment
 
@@ -226,9 +334,17 @@ pm2 logs stellar-stream-backend --lines 100 | grep -i "restore"
 
 This indicates that the database backup was interrupted before completion (e.g. copied during active writes without proper checkpointing or lock) or corrupted. The startup integrity check (`PRAGMA integrity_check;`) detects this state and sets `sqlite_restore_outcome` to `3` (`interrupted`).
 
+For the backup side of the same condition — detecting an interrupted run, the
+retry boundary, and rolling back to the last verified snapshot — see
+[When a backup is interrupted before completion](#when-a-backup-is-interrupted-before-completion).
+
 **Owner Action:**
 
-1. Discard the incomplete or corrupted backup file.
+1. Discard the incomplete or corrupted backup file. Confirm which remaining
+   backups are usable before deleting anything:
+   ```bash
+   bash scripts/sqlite-backup.sh --verify /data-backup/streams-20260101.db
+   ```
 2. Restore a valid, complete backup (or a fresh backup taken when the service was stopped or using `.backup`).
 3. Restart the backend service.
 4. Confirm the signal returns to `success` (`0`).
@@ -240,8 +356,6 @@ This indicates that the database backup was interrupted before completion (e.g. 
 pm2 logs stellar-stream-backend --lines 100 | grep -i "restore"
 ```
 
-````
-
 #### Validation from a clean environment
 
 To confirm the restore behavior is reproducible without undocumented local state:
@@ -251,7 +365,7 @@ To confirm the restore behavior is reproducible without undocumented local state
    ```bash
    cd backend
    npx vitest run src/services/dbRestoreOutcome.restore.test.ts
-````
+   ```
 
 All 12 tests must pass. They build temporary in-memory databases at
 specific schema versions and verify the exact outcome signal and Prometheus
@@ -260,6 +374,13 @@ gauge value for each scenario. 3. Optionally, run the full suite to confirm no r
 ```bash
 cd backend && npx vitest run
 ```
+
+4. Run the backup-script tests, which cover an interrupted snapshot, the retry
+   boundary, and rollback of a published-but-unusable backup without a live
+   database:
+   ```bash
+   npm run test:sqlite-backup
+   ```
 
 ---
 
